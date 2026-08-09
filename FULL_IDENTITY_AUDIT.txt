@@ -1,0 +1,1917 @@
+"""
+vision/identity/identity_manager.py
+-----------------------------------
+The orchestrator. Turns a stream of tracker observations into stable global
+identities.
+
+Its whole job is to answer one question per track: *who is this?* — and to
+answer it as rarely as possible.
+
+Two rules make the difference between a system that works and one that
+oscillates:
+
+  1. STICKY BINDINGS. Once a track is committed to a global id, the binding
+     is not revisited. The tracker (BoT-SORT/ByteTrack) is *better* than any
+     ReID model at frame-to-frame association; it uses motion and IoU, which
+     appearance models do not have. ReID exists to bridge the gaps the
+     tracker cannot cross — not to second-guess it. Re-matching every frame
+     costs CPU and buys identity flicker.
+
+  2. PROBATION. A brand-new track_id is not counted immediately. It gathers
+     evidence over a few embeddable frames and only then commits — either to
+     an existing identity or to a new one. This is why a person walking back
+     into frame does not increment Visitors Today before the system has
+     decided who they are.
+
+Everything that changes a business number leaves through the EventBus, so
+counting, analytics, replay metadata and the dashboard all read the same
+stream of facts.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+
+from config import IdentityConfig
+from contracts import Embedding, IdentityDecision, MatchResult, TrackObservation, Verdict
+from events import EventBus
+from matching_engine import MatchingEngine
+from memory_engine import MemoryEngine
+from person_profile import PersonProfile
+from reid_engine import ReIDEngine
+
+
+@dataclass
+class TrackBinding:
+    """The live link between a tracker id and a global identity."""
+    track_id: int
+    global_id: Optional[str] = None
+    committed: bool = False
+    votes: List[MatchResult] = field(default_factory=list)
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    embeddings_seen: int = 0
+
+
+class IdentityManager:
+    """Tracker ids in, global ids out."""
+
+    def __init__(
+        self,
+        config: Optional[IdentityConfig] = None,
+        bus: Optional[EventBus] = None,
+        reid: Optional[ReIDEngine] = None,
+        memory: Optional[MemoryEngine] = None,
+    ) -> None:
+        self.config = config or IdentityConfig()
+        self.bus = bus or EventBus()
+        self.reid = reid or ReIDEngine(self.config.reid, camera_id=self.config.camera_id)
+        self.memory = memory or MemoryEngine(self.config.memory, self.config.camera_id, self.bus)
+        self.matcher = MatchingEngine(self.config.matching)
+
+        self._bindings: Dict[int, TrackBinding] = {}
+        # Lets the ReID scheduler spend idle budget only where it helps.
+        self.reid.gallery_has_room = self._gallery_has_room
+        self._last_sweep = 0.0
+        self._frame_index = 0
+
+    # ------------------------------------------------------------------
+    # Main entry point — called once per frame from main.py
+    # ------------------------------------------------------------------
+
+    def update(
+        self,
+        frame: Optional[np.ndarray],
+        observations: Sequence[TrackObservation],
+        now: Optional[float] = None,
+    ) -> Dict[int, IdentityDecision]:
+        """Resolve every visible track to a global identity."""
+        now = now or time.time()
+        self._frame_index += 1
+
+        active_ids = {obs.track_id for obs in observations}
+        self._retire_missing_tracks(active_ids, now)
+
+        # 1. Which tracks still need an answer? Those get the ReID budget.
+        pending = [obs for obs in observations
+                   if not self._binding(obs.track_id, now).committed]
+
+        embeddings: Dict[int, Embedding] = {}
+        # Whether pixels are required is the ReID engine's decision, not this
+        # one's: an offline replay drives the same logic with recorded vectors.
+        if observations:
+            selected = self.reid.select(
+                observations,
+                priority_track_ids=[o.track_id for o in pending],
+                frame_index=self._frame_index,
+            )
+            embeddings = self.reid.embed(frame, selected, frame_index=self._frame_index)
+
+        # 2. Resolve identities.
+        decisions: Dict[int, IdentityDecision] = {}
+        for obs in observations:
+            decisions[obs.track_id] = self._resolve(obs, embeddings.get(obs.track_id), now)
+
+        # 3. Housekeeping, at most once a second.
+        if now - self._last_sweep >= 1.0:
+            self.memory.sweep(now)
+            self._last_sweep = now
+
+        return decisions
+
+    # ------------------------------------------------------------------
+
+    def _resolve(self, obs: TrackObservation, emb: Optional[Embedding],
+                 now: float) -> IdentityDecision:
+        binding = self._binding(obs.track_id, now)
+        binding.last_seen = now
+
+        # --- already committed: sticky, no re-matching ---------------------
+        if binding.committed and binding.global_id:
+            profile = self.memory.get(binding.global_id)
+            if profile is not None:
+                _remember_tracker_id(profile, obs.track_id)
+                if emb is not None:
+                    profile.add_embedding(emb, self.config.memory.gallery_size,
+                                          self.config.memory.min_quality_improvement)
+                    binding.embeddings_seen += 1
+                return IdentityDecision(obs.track_id, binding.global_id, True, False,
+                                        profile.is_returning)
+            # The identity was swept while the track was alive (very long
+            # occlusion). Drop the binding and let probation run again.
+            binding.committed = False
+            binding.global_id = None
+
+        # --- probation: gather evidence ------------------------------------
+        if emb is None:
+            # Nothing new to learn this frame — stay uncommitted, stay uncounted.
+            return IdentityDecision(obs.track_id, binding.global_id, False, False, False)
+
+        binding.embeddings_seen += 1
+        claimed = {b.global_id for b in self._bindings.values()
+                   if b.global_id and b.track_id != obs.track_id and b.committed}
+
+        foot = ((obs.bbox[0] + obs.bbox[2]) / 2.0, obs.bbox[3])
+        vote = self.matcher.match(emb, self.memory.hot_candidates(), exclude_ids=claimed,
+                                  position=foot, now=now, frame_width=obs.frame_width)
+
+        # Hot memory drew a blank — ask warm memory: is this a returning visitor?
+        recovered_from_warm = False
+        if vote.verdict is Verdict.NEW:
+            # Warm memory is minutes or hours old, so motion says nothing
+            # useful about it — appearance has to carry that decision alone.
+            warm_vote = self.matcher.match(emb, self.memory.warm_candidates(),
+                                           exclude_ids=claimed)
+            if warm_vote.verdict is Verdict.MATCH:
+                vote = warm_vote
+                recovered_from_warm = True
+
+        binding.votes.append(vote)
+
+        if len(binding.votes) < self.config.matching.probation_frames:
+            return IdentityDecision(obs.track_id, None, False, False, False, match=vote)
+
+        # --- commit --------------------------------------------------------
+        final = self.matcher.evaluate_probation(binding.votes)
+        is_new = False
+        is_returning = False
+
+        if final.verdict is Verdict.MATCH and final.global_id:
+            profile = self.memory.get(final.global_id)
+            if profile is None:
+                profile = self.memory.create(now, emb)
+                is_new = True
+            elif recovered_from_warm or profile.global_id in {
+                    p.global_id for p in self.memory.warm_candidates()}:
+                profile = self.memory.promote(final.global_id, now) or profile
+                is_returning = True
+        else:
+            profile = self.memory.create(now, emb)
+            is_new = True
+
+        _remember_tracker_id(profile, obs.track_id)
+        profile.add_embedding(emb, self.config.memory.gallery_size,
+                              self.config.memory.min_quality_improvement)
+        if self.config.camera_id not in profile.cameras_seen:
+            profile.cameras_seen.append(self.config.camera_id)
+
+        binding.global_id = profile.global_id
+        binding.committed = True
+        binding.votes.clear()
+
+        if self.config.debug:
+            print(f"[IDENTITY] track={obs.track_id} -> {profile.global_id} "
+                  f"({'new' if is_new else 'matched'}"
+                  f"{', returning' if is_returning else ''}) {final.explain()}")
+
+        return IdentityDecision(obs.track_id, profile.global_id, True, is_new,
+                                is_returning or profile.is_returning, match=final)
+
+    # ------------------------------------------------------------------
+
+    def _gallery_has_room(self, tracker_id: int) -> bool:
+        binding = self._bindings.get(tracker_id)
+        if binding is None or not binding.global_id:
+            return True
+        profile = self.memory.get(binding.global_id)
+        return profile is None or len(profile.gallery) < self.config.memory.gallery_size
+
+    def _binding(self, track_id: int, now: float) -> TrackBinding:
+        binding = self._bindings.get(track_id)
+        if binding is None:
+            binding = TrackBinding(track_id=track_id, first_seen=now, last_seen=now)
+            self._bindings[track_id] = binding
+        return binding
+
+    def _retire_missing_tracks(self, active: set, now: float) -> None:
+        """A tracker id that vanished is forgotten immediately — but its
+        IDENTITY is not. That is the entire point of the architecture: the
+        track is ephemeral, the person is not."""
+        for track_id in [t for t in self._bindings if t not in active]:
+            self._bindings.pop(track_id, None)
+            self.reid.forget_track(track_id)
+
+    def global_id_for(self, track_id: int) -> Optional[str]:
+        binding = self._bindings.get(track_id)
+        return binding.global_id if binding and binding.committed else None
+
+    def profile_for(self, track_id: int) -> Optional[PersonProfile]:
+        gid = self.global_id_for(track_id)
+        return self.memory.get(gid) if gid else None
+
+    def diagnostics(self) -> Dict[str, object]:
+        return {
+            "frame": self._frame_index,
+            "live_tracks": len(self._bindings),
+            "committed_tracks": sum(1 for b in self._bindings.values() if b.committed),
+            "memory": self.memory.stats,
+            "reid": self.reid.diagnostics(),
+        }
+
+
+def _remember_tracker_id(profile: PersonProfile, tracker_id: int) -> None:
+    """Diagnostics only. The length of this list is a direct measure of how
+    much tracker churn the identity layer absorbed on this person's behalf —
+    it is never read by any metric."""
+    if tracker_id not in profile.track_ids_seen:
+        profile.track_ids_seen.append(tracker_id)
+================= MATCHING =================
+"""
+vision/identity/matching_engine.py
+----------------------------------
+Decides whether a new appearance belongs to someone we already know.
+
+The asymmetry that drives every design choice here
+--------------------------------------------------
+The two possible errors are NOT equally bad:
+
+  * FALSE SPLIT (one person counted as two) inflates Visitors Today. It is
+    visible, self-correcting over time, and merely embarrassing.
+  * FALSE MERGE (two people collapsed into one) is silent and permanent. It
+    corrupts that identity's gallery with a second person's appearance,
+    which causes further merges, which corrupts it further. It destroys
+    Journey and Average Visit Time, and there is no way to detect it after
+    the fact.
+
+So the engine is deliberately biased toward splitting, and is allowed to
+return AMBIGUOUS rather than guess. An ambiguous track stays in probation and
+gets re-evaluated with better crops. In a retail counter, "wait one more
+second before deciding" costs nothing.
+
+Three gates must all pass for a MATCH:
+  1. absolute:  best score >= match_threshold
+  2. relative:  best beats runner-up by min_margin_over_runner_up
+  3. feasible:  the candidate is temporally/spatially reachable
+"""
+
+from __future__ import annotations
+
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+
+from config import MatchingConfig
+from contracts import Embedding, MatchResult, Verdict
+from person_profile import PersonProfile
+
+
+class MatchingEngine:
+    """Stateless scorer. All state lives in MemoryEngine — which means this
+    class can be exhaustively unit-tested with hand-built profiles."""
+
+    def __init__(self, config: MatchingConfig) -> None:
+        self.config = config
+
+    def match(
+        self,
+        query: Embedding,
+        candidates: Sequence[PersonProfile],
+        feasible: Optional[Callable[[PersonProfile], bool]] = None,
+        exclude_ids: Iterable[str] = (),
+        position: Optional[Tuple[float, float]] = None,
+        now: Optional[float] = None,
+        frame_width: Optional[float] = None,
+    ) -> MatchResult:
+        """Score *query* against *candidates* and return an explained verdict.
+
+        Args:
+            feasible: optional reachability predicate. Two identities cannot
+                be the same person if they were seen 2 seconds apart at
+                opposite ends of the store, or on two cameras 40 metres apart.
+                Rejecting those BEFORE scoring is free accuracy — appearance
+                models have no concept of physics, so we supply it.
+            exclude_ids: identities already claimed by another live track in
+                this same frame. One person cannot be in two places at once,
+                so an id bound to a currently-visible track is not available.
+        """
+        excluded = set(exclude_ids)
+        scored: List[Tuple[float, PersonProfile]] = []
+
+        for profile in candidates:
+            if profile.global_id in excluded:
+                continue
+            if not profile.gallery:
+                continue
+            if feasible is not None and not feasible(profile):
+                continue
+
+            score = profile.similarity_to(query)
+            if self.config.use_motion_prior and position and frame_width and now:
+                reachable, proximity = self._motion_prior(profile, position, now, frame_width)
+                if not reachable:
+                    # Physically impossible. Appearance does not get a vote.
+                    continue
+                score += self.config.motion_bonus * proximity
+            scored.append((min(1.0, score), profile))
+
+        if not scored:
+            return MatchResult(verdict=Verdict.NEW, candidates_considered=0)
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        best_score, best = scored[0]
+        runner_score, runner_id = (scored[1][0], scored[1][1].global_id) if len(scored) > 1 else (0.0, None)
+
+        result = MatchResult(
+            verdict=Verdict.NEW,
+            global_id=best.global_id,
+            score=best_score,
+            runner_up_score=runner_score,
+            runner_up_id=runner_id,
+            candidates_considered=len(scored),
+        )
+
+        cfg = self.config
+
+        # --- solo re-association -------------------------------------------
+        if (cfg.solo_reassociation and position and frame_width and now
+                and result.verdict is not Verdict.MATCH):
+            solo = self._solo_candidate(scored, position, now, frame_width)
+            if solo is not None:
+                result.global_id = solo.global_id
+                result.verdict = Verdict.MATCH
+                result.score = max(best_score, cfg.match_threshold)
+                return result
+
+        if best_score < cfg.new_threshold:
+            result.verdict = Verdict.NEW
+            result.global_id = None
+            return result
+
+        if best_score < cfg.match_threshold:
+            # In the grey band: plausible, not proven. Refuse to decide.
+            result.verdict = Verdict.AMBIGUOUS
+            return result
+
+        if runner_id is not None and (best_score - runner_score) < cfg.min_margin_over_runner_up:
+            # Two people fit equally well — the classic uniformed-staff case.
+            result.verdict = Verdict.AMBIGUOUS
+            return result
+
+        result.verdict = Verdict.MATCH
+        return result
+
+    # ------------------------------------------------------------------
+
+    def _solo_candidate(self, scored, position, now, frame_width):
+        """The one identity this could possibly be — or None.
+
+        Deliberately conservative: any hint of a second person in the recent
+        past disqualifies the whole rule, because that is the only situation
+        in which it could merge two human beings.
+        """
+        cfg = self.config
+        window = cfg.solo_max_gap_seconds
+        recent = [p for _, p in scored if now - p.last_seen <= window]
+        if len(recent) != 1:
+            return None                      # nobody, or more than one: abstain
+        if len(scored) > 1:
+            # Someone else exists in memory. Only proceed if they are long gone.
+            others = [p for _, p in scored if p is not recent[0]]
+            if any(now - p.last_seen <= window for p in others):
+                return None
+
+        candidate = recent[0]
+        if candidate.last_position is None:
+            return None
+        dx = position[0] - candidate.last_position[0]
+        dy = position[1] - candidate.last_position[1]
+        if (dx * dx + dy * dy) ** 0.5 > cfg.solo_max_distance_frac * frame_width:
+            return None
+        return candidate
+
+    def _motion_prior(self, profile: PersonProfile, position: Tuple[float, float],
+                      now: float, frame_width: float) -> Tuple[bool, float]:
+        """(reachable, proximity 0..1) for a candidate, from motion alone."""
+        last = profile.last_position
+        if last is None:
+            return True, 0.0
+        elapsed = max(0.05, now - profile.last_seen)
+        reach = self.config.max_speed_frac_per_s * frame_width * elapsed
+        distance = ((position[0] - last[0]) ** 2 + (position[1] - last[1]) ** 2) ** 0.5
+        if distance > reach * self.config.motion_tolerance:
+            return False, 0.0
+        return True, max(0.0, 1.0 - distance / max(reach, 1.0))
+
+    def evaluate_probation(self, votes: Sequence[MatchResult]) -> MatchResult:
+        """Collapse several frames of evidence into one committed decision.
+
+        A track in probation is matched on each of its first N embeddable
+        frames. Committing requires a MAJORITY of those frames to agree on
+        the SAME id — one strong frame is not enough, because the strongest
+        single frame is often the one that got lucky.
+        """
+        if not votes:
+            return MatchResult(verdict=Verdict.AMBIGUOUS)
+
+        tally: dict[str, List[MatchResult]] = {}
+        for vote in votes:
+            if vote.verdict is Verdict.MATCH and vote.global_id:
+                tally.setdefault(vote.global_id, []).append(vote)
+
+        if not tally:
+            # Nobody was ever confidently matched -> genuinely a new person.
+            return MatchResult(
+                verdict=Verdict.NEW,
+                score=max(v.score for v in votes),
+                candidates_considered=max(v.candidates_considered for v in votes),
+            )
+
+        winner_id, winner_votes = max(tally.items(), key=lambda kv: (len(kv[1]), max(v.score for v in kv[1])))
+
+        if len(winner_votes) * 2 <= len(votes):
+            # No majority: the evidence is split. Prefer a new identity —
+            # a false split is recoverable, a false merge is not.
+            return MatchResult(
+                verdict=Verdict.NEW,
+                score=max(v.score for v in winner_votes),
+                global_id=None,
+            )
+
+        best = max(winner_votes, key=lambda v: v.score)
+        return MatchResult(
+            verdict=Verdict.MATCH,
+            global_id=winner_id,
+            score=best.score,
+            runner_up_score=best.runner_up_score,
+            runner_up_id=best.runner_up_id,
+            candidates_considered=best.candidates_considered,
+        )
+================= REID =================
+"""
+vision/identity/reid_engine.py
+------------------------------
+Turns person crops into appearance embeddings — and, just as importantly,
+decides WHICH crops are worth embedding at all.
+
+The performance reality
+-----------------------
+The naive design in the spec ("Crop Person -> ReID" for every person on every
+frame) does not survive contact with the hardware this runs on. On a laptop
+CPU, OSNet-x0.25 costs roughly 6-12 ms per crop. Eight shoppers in frame is
+~80 ms of ReID *on top of* YOLO, and a 25 FPS engine becomes a 7 FPS engine —
+at which point the tracker starts losing people, which creates more identity
+work, which slows it further.
+
+Two mechanisms keep the cost bounded and the accuracy high:
+
+  1. QUALITY GATE — a tiny, blurry, or truncated crop yields a garbage
+     vector, and a garbage vector in a gallery causes false merges *forever
+     after*. Rejecting bad crops is not an optimisation, it is the main
+     accuracy lever. Most frames of most people are not worth embedding.
+  2. FRAME BUDGET — at most N crops per frame, spent on the tracks that need
+     it most (new/probationary first, then stalest gallery). A committed,
+     well-known track is refreshed rarely. Cost becomes O(budget), not
+     O(people).
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from config import ReIDConfig
+from contracts import BBox, Embedding, TrackObservation
+
+
+# Placeholder handed to pixel-free backends so batch lengths stay aligned.
+_NO_PIXELS = np.zeros((1, 1, 3), dtype=np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Quality gate
+# ---------------------------------------------------------------------------
+
+@dataclass
+class QualityReport:
+    passed: bool
+    score: float
+    reason: str = ""
+
+
+def assess_crop(obs: TrackObservation, cfg: ReIDConfig, crop: Optional[np.ndarray]) -> QualityReport:
+    """Decide whether this observation deserves an embedding, and how much to
+    trust it if so. Returns a 0..1 quality score used for gallery ranking."""
+    x1, y1, x2, y2 = obs.bbox
+    w, h = x2 - x1, y2 - y1
+
+    if obs.confidence < cfg.min_detection_confidence:
+        return QualityReport(False, 0.0, f"low_confidence({obs.confidence:.2f})")
+    if h < cfg.min_bbox_height_px or w < cfg.min_bbox_width_px:
+        return QualityReport(False, 0.0, f"too_small({int(w)}x{int(h)})")
+
+    # Not all truncation is equal — a distinction learned from real footage.
+    #
+    # The original rule rejected a crop touching ANY frame edge. On a store
+    # camera that is right. On a camera where people walk close, EVERY person
+    # is cut off at the bottom, so the gate rejected 98% of crops and the
+    # engine had almost no embeddings to re-identify anyone with.
+    #
+    #   left / right  -> the body is cut ACROSS its width. Half a torso is
+    #                    genuinely unusable, and the missing half is a
+    #                    different half from frame to frame: reject.
+    #   top / bottom  -> the head or the legs are missing. The TORSO — which
+    #                    carries nearly all of the clothing signal a ReID
+    #                    model relies on — is intact. Usable, provided crops
+    #                    are normalised consistently (see crop_mode).
+    #
+    # This distinction came from real footage: on a camera people walk close
+    # to, 94% of detections touched the TOP edge (heads above frame). The
+    # original rule rejected all of them, the engine got 6 embeddings out of
+    # 394 detections, and re-identification had nothing to work with.
+    m = cfg.border_margin_px
+    if x1 <= m or x2 >= obs.frame_width - m:
+        return QualityReport(False, 0.0, "truncated_at_side")
+
+    vertical_cut = y1 <= m or y2 >= obs.frame_height - m
+    bottom_cut = vertical_cut
+    aspect = h / max(w, 1.0)
+    if not bottom_cut:
+        if not (cfg.min_aspect_ratio <= aspect <= cfg.max_aspect_ratio):
+            # Wrong aspect = two overlapping people in one box, or a partial body.
+            return QualityReport(False, 0.0, f"bad_aspect({aspect:.2f})")
+    elif aspect > cfg.max_aspect_ratio:
+        return QualityReport(False, 0.0, f"bad_aspect({aspect:.2f})")
+
+    sharpness = 1.0
+    if crop is not None and crop.size:
+        try:
+            import cv2
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            if lap_var < cfg.min_sharpness:
+                return QualityReport(False, 0.0, f"blurry({lap_var:.0f})")
+            sharpness = min(1.0, lap_var / 400.0)
+        except Exception:
+            pass
+
+    # Composite score: bigger, more confident, sharper crops rank higher and
+    # therefore win gallery slots.
+    size_score = min(1.0, h / 320.0)
+    score = 0.45 * size_score + 0.30 * float(obs.confidence) + 0.25 * sharpness
+    return QualityReport(True, round(min(1.0, score), 4))
+
+
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+class ColorHistogramBackend:
+    """Dependency-free baseline: HSV histograms of the torso and legs.
+
+    Honest about what it is — this is *weak* ReID. It handles "same person
+    walked behind a shelf and came back 8 seconds later" acceptably and fails
+    on anything harder, especially across cameras with different white
+    balance. It exists so the pipeline runs end-to-end on day one, and so
+    every other module can be developed and tested before a torch dependency
+    is introduced. Ship the real backend before trusting cross-camera ids.
+    """
+
+    name = "color_histogram"
+
+    def __init__(self, dim: int = 128) -> None:
+        self.dim = dim
+
+    def embed_batch(self, crops: Sequence[np.ndarray]) -> np.ndarray:
+        import cv2
+        out = np.zeros((len(crops), self.dim), dtype=np.float32)
+        for i, crop in enumerate(crops):
+            if crop is None or crop.size == 0:
+                continue
+            h = crop.shape[0]
+            # Split vertically: torso and legs carry the clothing signal;
+            # the head region is mostly noise at retail resolutions.
+            bands = [crop[int(h * 0.15):int(h * 0.55)], crop[int(h * 0.55):int(h * 0.95)]]
+            feats = []
+            for band in bands:
+                if band.size == 0:
+                    feats.append(np.zeros(64, dtype=np.float32))
+                    continue
+                hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+                hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
+                hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
+                feats.append(hist[:64])
+            vec = np.concatenate(feats)[: self.dim]
+            if vec.shape[0] < self.dim:
+                vec = np.pad(vec, (0, self.dim - vec.shape[0]))
+            out[i] = vec
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        return out / np.maximum(norms, 1e-6)
+
+
+class OSNetBackend:
+    """Production backend: OSNet via torchreid, batched, half precision on GPU.
+
+    Loaded lazily so importing this package never drags in torch. Raises on
+    construction if torchreid is unavailable, so ReIDEngine can fall back
+    loudly rather than silently degrading.
+    """
+
+    name = "osnet"
+
+    def __init__(self, model_name: str = "osnet_x0_25", device: Optional[str] = None) -> None:
+        import torch  # noqa: F401
+        import torchreid
+
+        self._torch = torch
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = torchreid.models.build_model(
+            name=model_name, num_classes=1000, pretrained=True
+        )
+        self.model.eval().to(self.device)
+        self.dim = 512
+        self._input_size = (256, 128)  # h, w — the ReID standard
+        self._mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self._std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+    def embed_batch(self, crops: Sequence[np.ndarray]) -> np.ndarray:
+        import cv2
+        torch = self._torch
+        if not crops:
+            return np.zeros((0, self.dim), dtype=np.float32)
+
+        batch = np.zeros((len(crops), 3, *self._input_size), dtype=np.float32)
+        for i, crop in enumerate(crops):
+            img = cv2.resize(crop, (self._input_size[1], self._input_size[0]))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            img = (img - self._mean) / self._std
+            batch[i] = img.transpose(2, 0, 1)
+
+        with torch.no_grad():
+            tensor = torch.from_numpy(batch).to(self.device)
+            feats = self.model(tensor).cpu().numpy().astype(np.float32)
+
+        norms = np.linalg.norm(feats, axis=1, keepdims=True)
+        return feats / np.maximum(norms, 1e-6)
+
+
+def build_backend(cfg: ReIDConfig):
+    """Pick a backend, announcing loudly what was chosen and why.
+
+    Silent fallback is forbidden here: an operator must never be told
+    "identity is running" while it is actually running on colour histograms.
+    """
+    wanted = (cfg.backend or "auto").lower()
+    if wanted in ("auto", "osnet"):
+        try:
+            backend = OSNetBackend()
+            print(f"[REID] backend=osnet device={backend.device} dim={backend.dim}")
+            return backend
+        except Exception as exc:
+            if wanted == "osnet":
+                raise RuntimeError(
+                    "COREWISE_REID_BACKEND=osnet was requested but torchreid could not "
+                    f"be loaded: {exc}. Install with: pip install torch torchreid"
+                ) from exc
+            print(f"[REID] WARNING: OSNet unavailable ({exc.__class__.__name__}). "
+                  "Falling back to the colour-histogram baseline — cross-camera "
+                  "identity will be unreliable until torchreid is installed.")
+    backend = ColorHistogramBackend()
+    print(f"[REID] backend=color_histogram dim={backend.dim} (baseline)")
+    return backend
+
+
+# ---------------------------------------------------------------------------
+# Engine
+# ---------------------------------------------------------------------------
+
+class ReIDEngine:
+    """Quality gate + frame budget + batched inference."""
+
+    def __init__(self, config: ReIDConfig, camera_id: str = "cam_1", backend=None) -> None:
+        self.config = config
+        self.camera_id = camera_id
+        self.backend = backend or build_backend(config)
+        self._last_embedded_frame: Dict[int, int] = {}
+        self._upper_body_mode = (config.crop_mode == "upper_body")
+        self._auto_decided = config.crop_mode != "auto"
+        self._auto_seen = 0
+        self._auto_truncated = 0
+        # Set by IdentityManager: "does this track's identity still have room
+        # for another viewpoint?" Keeps the spare budget from re-embedding a
+        # person whose gallery is already full and diverse.
+        self.gallery_has_room = None
+        self.stats = {"gated_out": 0, "embedded": 0, "budget_skipped": 0}
+        self._gate_reasons: Dict[str, int] = {}
+
+    # ------------------------------------------------------------------
+
+    def crop_person(self, frame: np.ndarray, bbox: BBox,
+                    upper_body: Optional[bool] = None) -> Optional[np.ndarray]:
+        x1, y1, x2, y2 = (int(round(v)) for v in bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2 = min(frame.shape[1], x2)
+        y2 = min(frame.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        if upper_body is None:
+            upper_body = self._upper_body_mode
+        if upper_body:
+            # Central torso band. Taking the MIDDLE of the visible box gives
+            # roughly the same body region whether it is the head or the legs
+            # that fell outside the frame — which is what makes two crops of
+            # the same person comparable at all.
+            height = y2 - y1
+            band = max(1, int(height * self.config.upper_body_fraction))
+            centre = y1 + height // 2
+            y1 = max(0, centre - band // 2)
+            y2 = min(frame.shape[0], y1 + band)
+        return frame[y1:y2, x1:x2]
+
+    def _observe_truncation(self, obs: TrackObservation) -> None:
+        """Decide the crop convention from the footage itself.
+
+        Runs only while crop_mode is "auto", over the first N observations.
+        Announcing the decision matters: an operator must be able to see WHY
+        the engine is looking at torsos.
+        """
+        if self.config.crop_mode != "auto" or self._auto_decided:
+            return
+        self._auto_seen += 1
+        if (obs.bbox[3] >= obs.frame_height - self.config.border_margin_px
+                or obs.bbox[1] <= self.config.border_margin_px):
+            self._auto_truncated += 1
+        if self._auto_seen < self.config.auto_sample_size:
+            return
+        ratio = self._auto_truncated / self._auto_seen
+        self._auto_decided = True
+        if ratio >= self.config.auto_truncation_ratio:
+            self._upper_body_mode = True
+            print(f"[REID] {ratio*100:.0f}% of detections are cut off at the top or "
+                  "bottom of the frame — switching to torso crops so every embedding "
+                  "is comparable. (People walk close to this camera.)")
+        else:
+            print(f"[REID] full-body crops ({ratio*100:.0f}% bottom-truncated).")
+
+    def select(
+        self,
+        observations: Sequence[TrackObservation],
+        priority_track_ids: Sequence[int] = (),
+        frame_index: int = 0,
+    ) -> List[TrackObservation]:
+        """Choose which observations get embedded this frame.
+
+        Priority order:
+          1. tracks with no identity yet (new / in probation) — these are the
+             only ones whose answer actually changes a count;
+          2. committed tracks whose gallery refresh is due;
+          3. SPARE BUDGET: anything else, to build galleries out.
+
+        Step 3 was added after real footage. The budget exists to bound cost
+        when the store is busy — but with one or two people in frame it went
+        almost entirely unspent, and identities ended up with two or three
+        views each. A gallery that thin decides a match on one unlucky crop:
+        the same person scored 0.99 on their best pair of views and 0.46 on
+        their worst, and with three views in the gallery it was luck which one
+        the comparison landed on.
+
+        Spending an idle budget is free accuracy. When the store IS busy,
+        steps 1 and 2 fill the budget on their own and this changes nothing.
+        """
+        priority = set(priority_track_ids)
+        urgent, routine, spare = [], [], []
+
+        for obs in observations:
+            if obs.track_id in priority:
+                urgent.append(obs)
+                continue
+            last = self._last_embedded_frame.get(obs.track_id)
+            if last is None or frame_index - last >= self.config.refresh_every_n_frames:
+                routine.append(obs)
+            elif frame_index - last >= self.config.min_frames_between_crops:
+                # Not due, but the budget is there. Only worth spending on a
+                # gallery that still has room for another viewpoint.
+                spare.append(obs)
+
+        routine.sort(key=lambda o: self._last_embedded_frame.get(o.track_id, -10_000))
+        spare.sort(key=lambda o: self._last_embedded_frame.get(o.track_id, -10_000))
+
+        budget = self.config.max_crops_per_frame
+        chosen = (urgent + routine)[:budget]
+        if len(chosen) < budget and self.gallery_has_room is not None:
+            for obs in spare:
+                if len(chosen) >= budget:
+                    break
+                if self.gallery_has_room(obs.track_id):
+                    chosen.append(obs)
+
+        skipped = len(urgent) + len(routine) - len(chosen)
+        if skipped > 0:
+            self.stats["budget_skipped"] += skipped
+        return chosen
+
+    def embed(
+        self,
+        frame: np.ndarray,
+        observations: Sequence[TrackObservation],
+        frame_index: int = 0,
+    ) -> Dict[int, Embedding]:
+        """Embed the selected observations that survive the quality gate."""
+        crops: List[np.ndarray] = []
+        keep: List[Tuple[TrackObservation, float]] = []
+        # A backend may declare that it works without pixels — the offline
+        # tuner serves embeddings recorded during an earlier pass, so a
+        # threshold sweep never re-runs detection or inference.
+        needs_pixels = getattr(self.backend, "needs_pixels", True)
+
+        for obs in observations:
+            self._observe_truncation(obs)
+            crop = obs.crop
+            if crop is None and frame is not None:
+                crop = self.crop_person(frame, obs.bbox)
+            report = assess_crop(obs, self.config, crop)
+            if not report.passed or (crop is None and needs_pixels):
+                self.stats["gated_out"] += 1
+                reason = report.reason or "no_pixels"
+                self._gate_reasons[reason] = self._gate_reasons.get(reason, 0) + 1
+                continue
+            crops.append(crop if crop is not None else _NO_PIXELS)
+            keep.append((obs, report.score))
+
+        if not crops:
+            return {}
+
+        if getattr(self.backend, "wants_keys", False):
+            # Opt-in: the backend receives a stable (frame, track) key per crop.
+            # Used by the offline tuner to serve PRE-COMPUTED embeddings, so a
+            # threshold sweep costs seconds instead of another full YOLO pass.
+            vectors = self.backend.embed_batch(
+                crops, keys=[(o.frame_index, o.track_id) for o, _ in keep])
+        else:
+            vectors = self.backend.embed_batch(crops)
+        self.stats["embedded"] += len(crops)
+
+        out: Dict[int, Embedding] = {}
+        for (obs, quality), vector in zip(keep, vectors):
+            out[obs.track_id] = Embedding(
+                vector=vector, quality=quality,
+                timestamp=obs.timestamp, camera_id=self.camera_id,
+            )
+            self._last_embedded_frame[obs.track_id] = frame_index
+        return out
+
+    def forget_track(self, track_id: int) -> None:
+        self._last_embedded_frame.pop(track_id, None)
+
+    def diagnostics(self) -> Dict[str, object]:
+        """What the quality gate is actually rejecting — the first thing to
+        look at when identity accuracy is poor. A gate rejecting 95% of crops
+        means the camera is too far away or the thresholds are wrong, and no
+        amount of threshold tuning downstream will fix it."""
+        return {**self.stats, "backend": self.backend.name,
+                "crop_mode": "upper_body" if self._upper_body_mode else "full",
+                "gate_reasons": dict(sorted(self._gate_reasons.items(),
+                                            key=lambda kv: -kv[1])[:8])}
+================= PROFILE =================
+"""
+vision/identity/person_profile.py
+---------------------------------
+``PersonProfile`` — everything the system knows about one real human being.
+
+The important design decision here is the **gallery**: an identity is not
+represented by one embedding but by a small set of diverse, high-quality
+views. A single embedding is a photograph of a person at one instant; a
+person walking through a store presents their front, side and back, under
+three different light levels, at four different scales. Matching a rear view
+against a stored front view scores ~0.4 and looks exactly like a different
+person.
+
+Matching against a gallery of diverse views is what turns re-identification
+from a demo into a product.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+from contracts import Embedding, Side
+
+
+@dataclass
+class Visit:
+    """One continuous presence inside the store."""
+    entered_at: float
+    exited_at: Optional[float] = None
+
+    @property
+    def duration(self) -> float:
+        return (self.exited_at or time.time()) - self.entered_at
+
+    @property
+    def is_open(self) -> bool:
+        return self.exited_at is None
+
+
+@dataclass
+class RetailState:
+    """The three business flags of one person, plus WHY they are what they
+    are. ``sam_reason`` exists so "why is SAM zero" is answerable from a
+    live profile instead of from a debugger."""
+    counted_tam: bool = False
+    counted_sam: bool = False
+    counted_som: bool = False
+    sam_reason: str = "not evaluated yet"
+
+    def absorb(self, other: "RetailState") -> None:
+        self.counted_tam = self.counted_tam or other.counted_tam
+        self.counted_sam = self.counted_sam or other.counted_sam
+        self.counted_som = self.counted_som or other.counted_som
+        if other.counted_sam and not self.counted_sam:
+            self.sam_reason = other.sam_reason
+
+
+@dataclass
+class PersonProfile:
+    """A globally-identified person. The 'GlobalPerson' of the spec."""
+
+    global_id: str
+    camera_id: str
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+
+    gallery: List[Embedding] = field(default_factory=list)
+
+    side: Side = Side.UNKNOWN
+    current_zone: Optional[str] = None
+    zone_path: List[Tuple[str, float]] = field(default_factory=list)  # journey
+    visits: List[Visit] = field(default_factory=list)
+
+    cameras_seen: List[str] = field(default_factory=list)
+    track_ids_seen: List[int] = field(default_factory=list)
+    last_position: Optional[Tuple[float, float]] = None
+    # Corewise Intelligence Layer
+
+    appearance: Dict = field(default_factory=dict)
+
+    pose: Dict = field(default_factory=dict)
+
+    behavior: Dict = field(default_factory=dict)
+
+    # --- per-person retail + dwell state (owned by Zone/Retail engines) ----
+    # Living ON the profile is what makes memory.merge() able to reconcile
+    # TAM/SAM/dwell in one place instead of chasing state across engines.
+    retail: "RetailState" = None            # created in __post_init__
+    zone_dwell_banked: Dict[str, float] = field(default_factory=dict)
+    zone_entered_at: Dict[str, float] = field(default_factory=dict)
+    # Set when this identity was pulled back out of warm memory, i.e. the
+    # person left and came back later. Drives the Returning Visitors metric.
+    is_returning: bool = False
+    recovered_at: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.retail is None:
+            self.retail = RetailState()
+
+    # ------------------------------------------------------------- dwell
+    def zone_dwell(self, zone: str, now: Optional[float] = None) -> float:
+        """Total seconds this person has spent in ``zone`` — banked closed
+        intervals plus the currently open one. Survives tracker loss by
+        construction: the clock lives on the PERSON, not on any track."""
+        now = now if now is not None else time.time()
+        banked = self.zone_dwell_banked.get(zone, 0.0)
+        entered = self.zone_entered_at.get(zone)
+        if entered is not None:
+            banked += max(0.0, now - entered)
+        return banked
+
+    # ---------------------------------------------------------------- gallery
+
+    def add_embedding(self, emb: Embedding, max_size: int, min_improvement: float) -> bool:
+        """Add a view to the gallery, keeping it small AND diverse.
+
+        Replacement policy, in order:
+          1. Room left      -> just append.
+          2. New crop is very similar to an existing one (a near-duplicate,
+             e.g. the person standing still) -> only replace that one, and
+             only if it is meaningfully better quality. This is what stops a
+             stationary shopper from flushing every other viewpoint out of
+             their own gallery.
+          3. Otherwise      -> evict the lowest-quality entry, if the newcomer
+             beats it.
+        """
+        if len(self.gallery) < max_size:
+            self.gallery.append(emb)
+            return True
+
+        sims = [emb.similarity(g) for g in self.gallery]
+        most_similar = int(np.argmax(sims))
+
+        if sims[most_similar] > 0.92:  # near-duplicate viewpoint
+            if emb.quality > self.gallery[most_similar].quality + min_improvement:
+                self.gallery[most_similar] = emb
+                return True
+            return False
+
+        weakest = min(range(len(self.gallery)), key=lambda i: self.gallery[i].quality)
+        if emb.quality > self.gallery[weakest].quality + min_improvement:
+            self.gallery[weakest] = emb
+            return True
+        return False
+
+    def similarity_to(self, query: Embedding) -> float:
+        """Best match across every stored viewpoint.
+
+        Max (not mean) is correct: a person seen from behind SHOULD match
+        their stored rear view strongly, and it is irrelevant that it matches
+        their stored front view weakly. Averaging would punish exactly the
+        diversity the gallery exists to provide.
+        """
+        if not self.gallery:
+            return 0.0
+        return max(query.similarity(g) for g in self.gallery)
+
+    @property
+    def best_quality(self) -> float:
+        return max((g.quality for g in self.gallery), default=0.0)
+
+    # ------------------------------------------------------------ lifecycle
+
+    def touch(self, timestamp: float, track_id: Optional[int] = None,
+              position: Optional[Tuple[float, float]] = None) -> None:
+        self.last_seen = timestamp
+        if position is not None:
+            self.last_position = position
+        if track_id is not None and track_id not in self.track_ids_seen:
+            self.track_ids_seen.append(track_id)
+
+    def open_visit(self, timestamp: float) -> Visit:
+        if self.visits and self.visits[-1].is_open:
+            return self.visits[-1]
+        visit = Visit(entered_at=timestamp)
+        self.visits.append(visit)
+        return visit
+
+    def close_visit(self, timestamp: float) -> Optional[Visit]:
+        if self.visits and self.visits[-1].is_open:
+            self.visits[-1].exited_at = timestamp
+            return self.visits[-1]
+        return None
+
+    def record_zone(self, zone: Optional[str], timestamp: float) -> bool:
+        """Append to the journey when the zone actually changes."""
+        if zone == self.current_zone:
+            return False
+        self.current_zone = zone
+        if zone is not None:
+            self.zone_path.append((zone, timestamp))
+        return True
+
+    # -------------------------------------------------------------- metrics
+
+    @property
+    def total_dwell(self) -> float:
+        return sum(v.duration for v in self.visits)
+
+    @property
+    def visit_count(self) -> int:
+        return len(self.visits)
+
+    @property
+    def age_seconds(self) -> float:
+        return time.time() - self.first_seen
+
+    def summary(self) -> Dict:
+        return {
+            "global_id": self.global_id,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "side": self.side.value,
+            "visits": self.visit_count,
+            "total_dwell": round(self.total_dwell, 1),
+            "gallery": len(self.gallery),
+            "returning": self.is_returning,
+            "journey": [z for z, _ in self.zone_path],
+            "cameras": list(self.cameras_seen),
+        }
+
+    def to_persistable(self) -> Dict:
+        """Serialisable form for the warm tier.
+
+        NOTE: embeddings only — never crops, never faces. See the privacy
+        section of ARCHITECTURE.md; this is the boundary that keeps the
+        product on the right side of biometric-data rules.
+        """
+        return {
+            "global_id": self.global_id,
+            "camera_id": self.camera_id,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "visits": [(v.entered_at, v.exited_at) for v in self.visits],
+            "gallery": [
+                {"v": g.vector.tolist(), "q": g.quality, "t": g.timestamp, "c": g.camera_id}
+                for g in self.gallery
+            ],
+        }
+
+================= PIPELINE =================
+"""
+vision/pipeline.py
+------------------
+One object that wires the whole identity-first system together, and speaks
+the data format ``main.py`` already produces.
+
+Every engine downstream of the tracker receives a ``PersonProfile``. The
+only place a ``track_id`` exists at all is the binding table inside
+``IdentityManager`` and the conversion below — after that, the system knows
+only people.
+
+Integration into the existing engine:
+
+    from vision.pipeline import IdentityPipeline
+
+    # once, replacing self.tracker:
+    self.identity = IdentityPipeline(camera_id=rp.default_camera_id())
+
+    # in _apply_calibration, with the SAME pixel points already computed:
+    self.identity.configure(tam_polygon_px=self.tam_zone_np.tolist(),
+                            som_points_px=self.som_points_px,
+                            som_is_polygon=self.som_is_polygon,
+                            named_zones_px={"Vegetables": [...], "Checkout": [...]})
+
+    # in _apply_sam_min_stay:
+    self.identity.set_min_stay(enabled, seconds)
+
+    # once per frame, after self.detector.track_people(frame):
+    stats = self.identity.process(frame, detections)
+
+``detections`` is exactly what ``detection.PersonDetector.track_people``
+returns today. ``stats`` is key-for-key compatible with
+``PersonTracker.get_stats()``, plus the new identity metrics — so the
+websocket protocol, ``app.py`` and ``reports.py`` need no changes.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+from analytics_engine import AnalyticsEngine
+from config import IdentityConfig
+from contracts import TrackObservation
+from entry_exit_engine import EntryExitEngine
+from events import EventBus
+from heatmap_engine import HeatmapEngine
+from identity_manager import IdentityManager
+from journey_engine import JourneyEngine
+from memory_engine import MemoryEngine
+from person_profile import PersonProfile
+from reid_engine import ReIDEngine
+from retail_engine import RetailEngine
+from zone_engine import SOM_ZONE, TAM_ZONE, ZoneEngine
+
+Point = Tuple[float, float]
+
+
+class IdentityPipeline:
+    """Detector output in, retail analytics out — with people in between."""
+
+    def __init__(
+        self,
+        camera_id: str = "cam_1",
+        config: Optional[IdentityConfig] = None,
+        backend: Optional[Any] = None,
+        storage_dir=None,
+        funnel_steps: Optional[Sequence[str]] = None,
+    ) -> None:
+        self.config = config or IdentityConfig(camera_id=camera_id)
+        self.config.camera_id = camera_id
+
+        self.bus = EventBus()
+
+        # --- identity layer -------------------------------------------------
+        self.reid = ReIDEngine(self.config.reid, camera_id=camera_id, backend=backend)
+        self.memory = MemoryEngine(self.config.memory, camera_id, self.bus,
+                                   storage_dir=storage_dir)
+        self.identity = IdentityManager(self.config, bus=self.bus,
+                                        reid=self.reid, memory=self.memory)
+
+        # --- everything below speaks PersonProfile only ---------------------
+        self.zones = ZoneEngine(self.config.zones, camera_id, self.bus)
+        self.retail = RetailEngine(self.config.retail, self.config.zones,
+                                   self.zones, camera_id, self.bus)
+        self.entry_exit = EntryExitEngine(self.config.zones, camera_id, self.bus)
+        self.journey = JourneyEngine()
+        self.heatmap = HeatmapEngine()
+        self.analytics = AnalyticsEngine(retail=self.retail, entry_exit=self.entry_exit,
+                                         journey=self.journey, heatmap=self.heatmap,
+                                         funnel_steps=funnel_steps)
+
+        for sink in (self.retail, self.journey, self.heatmap, self.analytics):
+            self.bus.subscribe(sink)
+
+        # Closing an identity must close its zone visits and bank its dwell,
+        # or a long-staying customer who expires simply vanishes from the
+        # average instead of contributing their (large) sample to it.
+        self.memory.on_release(self._on_identity_released)
+
+        self._frame_index = 0
+        self._last_save = time.time()
+        # Last frame's identity decisions, exposed for observability (the
+        # shadow runner records score distributions and the ambiguity rate
+        # from here). Read-only by convention.
+        self.last_decisions: Dict[int, Any] = {}
+        self._seen_this_frame: set[str] = set()
+        self._live_ids: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
+
+    def configure(
+        self,
+        tam_polygon_px: Optional[Sequence[Sequence[float]]] = None,
+        som_points_px: Optional[Sequence[Sequence[float]]] = None,
+        som_is_polygon: bool = False,
+        som_direction: int = +1,
+        named_zones_px: Optional[Dict[str, Sequence[Sequence[float]]]] = None,
+        store_polygon_px: Optional[Sequence[Sequence[float]]] = None,
+        entry_line_px: Optional[Sequence[Sequence[float]]] = None,
+    ) -> None:
+        """Apply calibration in PIXELS.
+
+        ``named_zones_px`` is what turns Journey from a diagram into a
+        feature: {"Vegetables": [...], "Drinks": [...], "Checkout": [...]}.
+        Without it everything else still works; the journey is simply empty.
+        """
+        zones: Dict[str, Sequence[Sequence[float]]] = {}
+        if tam_polygon_px:
+            zones[TAM_ZONE] = tam_polygon_px
+        if som_points_px and som_is_polygon:
+            zones[SOM_ZONE] = som_points_px
+        if named_zones_px:
+            zones.update(named_zones_px)
+        self.zones.configure(zones, replace=True)
+
+        if som_points_px and not som_is_polygon:
+            self.retail.set_som_line(som_points_px, som_direction)
+        else:
+            self.retail.set_som_line(None)
+
+        # Store occupancy: the store outline if given, else the TAM zone,
+        # else the entrance line. One of the three always exists once a
+        # camera has been calibrated at all.
+        self.entry_exit.configure(
+            inside_polygon=store_polygon_px or tam_polygon_px,
+            entry_line=entry_line_px or (som_points_px if not som_is_polygon else None),
+            entry_direction=som_direction,
+        )
+
+    def set_min_stay(self, enabled: bool, seconds: Optional[float]) -> None:
+        self.retail.set_min_stay(enabled, seconds)
+
+    def set_funnel(self, steps: Sequence[str]) -> None:
+        self.analytics.funnel_steps = list(steps)
+
+    # ------------------------------------------------------------------
+    # Per-frame
+    # ------------------------------------------------------------------
+
+    def process(
+        self,
+        frame: Optional[np.ndarray],
+        detections: Sequence[Dict[str, Any]],
+        now: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Run one frame. Returns the telemetry payload for the dashboard."""
+        now = now or time.time()
+        self._frame_index += 1
+
+        h, w = (frame.shape[:2] if frame is not None
+                else getattr(self, "frame_size", (720, 1280)))
+        self.heatmap.frame_size = (h, w)
+
+        observations = [
+            TrackObservation(
+                track_id=int(d["id"]),
+                bbox=(float(d["box"][0]), float(d["box"][1]),
+                      float(d["box"][2]), float(d["box"][3])),
+                confidence=float(d["box"][4]) if len(d["box"]) > 4 else 1.0,
+                frame_index=self._frame_index,
+                timestamp=now,
+                frame_width=w,
+                frame_height=h,
+            )
+            for d in detections
+        ]
+
+        # ---- the ONLY place a tracker id is resolved to a person ----------
+        decisions = self.identity.update(frame, observations, now=now)
+        self.last_decisions = decisions
+
+        self._seen_this_frame = set()
+        for obs in observations:
+            decision = decisions.get(obs.track_id)
+            if decision is None or not decision.is_committed or not decision.global_id:
+                continue                      # still in probation: not counted
+            profile = self.memory.get(decision.global_id)
+            if profile is None:
+                continue
+            foot: Point = ((obs.bbox[0] + obs.bbox[2]) / 2.0, obs.bbox[3])
+            self._observe(profile, foot, now)
+
+        # Anyone not seen this frame stops accruing dwell — but keeps their
+        # open zone visits, because a tracker gap is not an exit. They stay on
+        # the watch list until the grace period elapses and their open interval
+        # is banked; dropping them immediately would mean a person who vanishes
+        # for one frame never has their clock closed at all.
+        for gid in list(self._live_ids - self._seen_this_frame):
+            profile = self.memory.get(gid)
+            if profile is None or self.zones.suspend(profile, now):
+                self._live_ids.discard(gid)
+        self._live_ids |= self._seen_this_frame
+
+        if now - self._last_save >= 300.0:
+            self.memory.save()
+            self._last_save = now
+
+        return self.telemetry(now)
+
+    def _observe(self, profile: PersonProfile, foot: Point, now: float) -> None:
+        """One person, one frame. Note that every call below takes a
+        PersonProfile — no engine past this line has ever seen a track id."""
+        self.heatmap.record(profile, foot, now)   # before touch(): needs the previous time
+        self.zones.update(profile, foot, now)
+        self.retail.update(profile, foot, now)
+        self.entry_exit.update(profile, foot, now)
+        profile.touch(now, position=foot)
+        self._seen_this_frame.add(profile.global_id)
+
+    def _on_identity_released(self, profile: PersonProfile, now: float) -> None:
+        self.zones.release(profile, now)
+        self.retail.release(profile, now)
+        self.entry_exit.forget(profile.global_id)
+        self._live_ids.discard(profile.global_id)
+
+    # ------------------------------------------------------------------
+    # Output
+    # ------------------------------------------------------------------
+
+    def label_for(self, track_id: int) -> str:
+        """Short id for the on-frame overlay: 'P-4431'.
+
+        Deliberately not the raw uuid, and deliberately never a name: the
+        overlay must not display anything that identifies a real person.
+        """
+        gid = self.identity.global_id_for(track_id)
+        return f"P-{gid[-4:]}" if gid else "..."
+
+    def profile_for(self, track_id: int) -> Optional[PersonProfile]:
+        return self.identity.profile_for(track_id)
+
+    def telemetry(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """Every derived number is computed against the FRAME's clock, not the
+        wall clock. One injected time source keeps live metrics, replayed
+        footage and unit tests producing identical numbers."""
+        payload = self.analytics.snapshot(now)
+        payload["identity_backend"] = self.reid.backend.name
+        return payload
+
+    def maps(self) -> Dict[str, Any]:
+        return self.analytics.maps()
+
+    def people(self) -> List[Dict[str, Any]]:
+        """Every live person, explained. Powers a 'who is in the store right
+        now' panel and answers 'why is this number what it is'."""
+        return [p.summary() for p in self.memory.hot_candidates()]
+
+    def diagnostics(self) -> Dict[str, Any]:
+        return {
+            "identity": self.identity.diagnostics(),
+            "zones": self.zones.public_zone_names(),
+            "entry_exit": self.entry_exit.stats(),
+            "retail": self.retail.get_stats(),
+        }
+
+    def reset_counters(self) -> None:
+        """Dashboard's Reset Analytics: clears counts, keeps calibration."""
+        self.retail.reset_counters()
+        self.journey.reset()
+        self.heatmap.reset()
+
+    def shutdown(self) -> None:
+        now = time.time()
+        for profile in self.memory.hot_candidates():
+            self._on_identity_released(profile, now)
+        self.memory.save()
+================= RETAIL =================
+"""
+vision/identity/retail_engine.py
+--------------------------------
+TAM / SAM / SOM — counted over GLOBAL IDENTITIES, not tracker ids.
+
+This is the module that fixes the headline bug: five people walking in
+together are five committed identities, so TAM goes up by five. And a person
+whose tracker id churns three times near the entrance is still ONE member of
+the ``_tam_ids`` set, so no cooldown heuristic is needed at all.
+
+The per-person flags live on ``profile.retail`` (so ``memory.merge`` can
+reconcile them); the sets here are the fast aggregate the dashboard reads.
+On IDENTITY_MERGED the sets are re-pointed at the surviving id, which is how
+"two ids proven to be one person" pulls TAM back down by one.
+
+Semantics (identical to tracking.py, but per person):
+    TAM  — the person entered the store floor (the TAM polygon).
+    SAM  — the person qualified as a "serious" visitor:
+             * if an SOM *polygon* / SAM area exists: they entered it, or
+             * dwell-based: they stayed inside TAM at least ``min_stay``
+               seconds. Until the dashboard sends a value, dwell-SAM is OFF
+               (single source of truth preserved from tracking.py).
+    SOM  — the person crossed the entrance line in the entry direction
+           (or entered the SOM polygon when it is an area).
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+from config import RetailConfig, ZoneConfig
+from events import EventBus, EventType, IdentityEvent
+from geometry import crossing_direction
+from person_profile import PersonProfile
+from zone_engine import SOM_ZONE, TAM_ZONE, ZoneEngine
+
+Point = Tuple[float, float]
+
+
+class RetailEngine:
+    """Folds per-person positions into the three business counters."""
+
+    def __init__(self, config: RetailConfig, zone_config: ZoneConfig,
+                 zones: ZoneEngine, camera_id: str = "cam_1",
+                 bus: Optional[EventBus] = None) -> None:
+        self.config = config
+        self.zone_config = zone_config
+        self.zones = zones
+        self.camera_id = camera_id
+        self.bus = bus or EventBus()
+
+        self._som_line: Optional[List[Point]] = None
+        self._som_direction: int = +1
+        self._last_pos: Dict[str, Point] = {}
+
+        # Sets of global ids. len() of a set IS the deduplicated count.
+        self._tam_ids: Set[str] = set()
+        self._sam_ids: Set[str] = set()
+        self._som_ids: Set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Configuration (dashboard-driven, mirrors tracking.py contracts)
+    # ------------------------------------------------------------------
+
+    def set_som_line(self, points: Optional[Sequence[Sequence[float]]],
+                     direction: int = +1) -> None:
+        if points and len(points) >= 2:
+            self._som_line = [(float(x), float(y)) for x, y in points]
+            self._som_direction = +1 if direction >= 0 else -1
+        else:
+            self._som_line = None
+
+    def set_min_stay(self, enabled: bool, seconds: Optional[float]) -> None:
+        self.config.sam_min_stay_enabled = bool(enabled)
+        self.config.sam_min_stay_seconds = (
+            float(seconds) if seconds is not None else None)
+        self.config.sam_configured = True
+
+    # ------------------------------------------------------------------
+    # EventSink: merges must reconcile the aggregate sets
+    # ------------------------------------------------------------------
+
+    def emit(self, event: IdentityEvent) -> None:
+        if event.type is not EventType.IDENTITY_MERGED:
+            return
+        keep = event.global_id
+        absorbed = event.data.get("absorbed")
+        if not absorbed:
+            return
+        for id_set, flag in ((self._tam_ids, "counted_tam"),
+                             (self._sam_ids, "counted_sam"),
+                             (self._som_ids, "counted_som")):
+            if absorbed in id_set:
+                id_set.discard(absorbed)
+                id_set.add(keep)
+        self._last_pos.pop(absorbed, None)
+
+    # ------------------------------------------------------------------
+    # Per frame, per person
+    # ------------------------------------------------------------------
+
+    def update(self, profile: PersonProfile, foot: Point, now: float) -> None:
+        gid = profile.global_id
+
+        # --- TAM: first confirmed presence on the store floor -------------
+        if not profile.retail.counted_tam and self.zones.is_inside(profile, TAM_ZONE):
+            profile.retail.counted_tam = True
+            self._tam_ids.add(gid)
+            profile.open_visit(now)
+            self._emit(EventType.ENTERED, profile, foot, now,
+                       data={"returning": profile.is_returning})
+
+        # --- SAM ----------------------------------------------------------
+        if not profile.retail.counted_sam:
+            if self.zones.has_zone(SOM_ZONE):
+                # An SOM polygon / SAM area was drawn: SAM is entry into it.
+                if self.zones.is_inside(profile, SOM_ZONE):
+                    self._mark_sam(profile, foot, now, "entered the SAM area")
+                else:
+                    profile.retail.sam_reason = "has not entered the SAM area"
+            elif not self.config.sam_configured:
+                profile.retail.sam_reason = (
+                    "withheld: dashboard has not configured SAM minimum stay")
+            elif (self.config.sam_min_stay_enabled
+                  and self.config.sam_min_stay_seconds is not None):
+                if not profile.retail.counted_tam:
+                    profile.retail.sam_reason = "not inside TAM yet"
+                else:
+                    dwell = profile.zone_dwell(TAM_ZONE, now)
+                    if dwell >= self.config.sam_min_stay_seconds:
+                        self._mark_sam(profile, foot, now,
+                                       f"dwell {dwell:.1f}s >= threshold")
+                    else:
+                        profile.retail.sam_reason = (
+                            f"dwell {dwell:.1f}s below "
+                            f"{self.config.sam_min_stay_seconds}s threshold")
+            elif profile.retail.counted_tam:
+                # Minimum stay explicitly disabled: SAM on TAM entry.
+                self._mark_sam(profile, foot, now, "min-stay disabled")
+
+        # --- SOM: entrance line crossing ----------------------------------
+        if not profile.retail.counted_som and self._som_line is not None:
+            prev = self._last_pos.get(gid)
+            if prev is not None:
+                if crossing_direction(prev, foot, self._som_line) == self._som_direction:
+                    profile.retail.counted_som = True
+                    self._som_ids.add(gid)
+                    self._emit(EventType.DWELL_MILESTONE, profile, foot, now,
+                               data={"milestone": "som"})
+        self._last_pos[gid] = foot
+
+    def release(self, profile: PersonProfile, now: float) -> None:
+        """Identity expired: close its visit and bank the duration."""
+        self._last_pos.pop(profile.global_id, None)
+        if profile.retail.counted_tam:
+            visit = profile.close_visit(now)
+            self._emit(EventType.EXITED, profile, None, now, data={
+                "visit_seconds": round(visit.duration, 1) if visit else 0.0})
+
+    # ------------------------------------------------------------------
+
+    def _mark_sam(self, profile: PersonProfile, foot: Point, now: float,
+                  how: str) -> None:
+        profile.retail.counted_sam = True
+        profile.retail.sam_reason = how
+        self._sam_ids.add(profile.global_id)
+        self._emit(EventType.DWELL_MILESTONE, profile, foot, now,
+                   data={"milestone": "sam", "how": how})
+
+    def _emit(self, etype: EventType, profile: PersonProfile,
+              foot: Optional[Point], now: float, data: Optional[dict] = None) -> None:
+        self.bus.emit(IdentityEvent(
+            type=etype, global_id=profile.global_id, camera_id=self.camera_id,
+            timestamp=now, position=foot, data=data or {}))
+
+    # ------------------------------------------------------------------
+    # Output — key-for-key compatible with PersonTracker.get_stats()
+    # ------------------------------------------------------------------
+
+    @property
+    def tam_count(self) -> int:
+        return len(self._tam_ids)
+
+    @property
+    def sam_count(self) -> int:
+        return len(self._sam_ids)
+
+    @property
+    def som_count(self) -> int:
+        return len(self._som_ids)
+
+    def counted(self, profile: PersonProfile) -> Dict[str, bool]:
+        return {"tam": profile.retail.counted_tam,
+                "sam": profile.retail.counted_sam,
+                "som": profile.retail.counted_som}
+
+    def get_stats(self) -> Dict[str, float]:
+        tam = self.tam_count
+        return {
+            "tam": tam,
+            "sam": self.sam_count,
+            "som": self.som_count,
+            "conversion_rate": round(100.0 * self.som_count / tam, 1) if tam else 0.0,
+            "som_shape": ("polygon" if self.zones.has_zone(SOM_ZONE)
+                          else "polyline" if self._som_line else "none"),
+        }
+
+    def reset_counters(self) -> None:
+        self._tam_ids.clear()
+        self._sam_ids.clear()
+        self._som_ids.clear()
+        self._last_pos.clear()
+
+================= CONFIG =================
+"""
+vision/identity/config.py
+-------------------------
+Every tunable of the Identity Engine, in one place, with the reasoning
+behind each default written next to it.
+
+Rule for this whole package: **no magic numbers outside this file.** If a
+constant appears in an algorithm, it lives here. That is what makes it
+possible to tune the system per store (a narrow boutique and a supermarket
+entrance need different thresholds) without editing algorithm code, and to
+A/B two configs against the same recorded footage.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+@dataclass
+class MatchingConfig:
+    """Thresholds that decide "same person" vs "new person"."""
+
+    # Cosine similarity above which a query is accepted as an existing
+    # identity. NOTE: 0.96 (the number in the original spec) is unreachable
+    # with any real appearance model — genuine re-entries of the same person
+    # under a different pose typically land at 0.60-0.85 with OSNet. A 0.96
+    # gate would simply never match, and every returning visitor would be
+    # counted as new. 0.72 is a realistic starting point; tune it against
+    # recorded footage using tools/tune_thresholds.py.
+    match_threshold: float = 0.72
+
+    # Below this, the query is definitely a new person.
+    new_threshold: float = 0.55
+
+    # Between new_threshold and match_threshold the answer is "don't know".
+    # We refuse to guess: the track goes into probation and is re-evaluated
+    # with better crops instead of being force-merged or force-split.
+    # This band is the single most important safety property of the engine.
+
+    # The best candidate must beat the runner-up by this margin. Without it,
+    # two similarly-dressed shoppers (very common: staff uniforms, winter
+    # coats) get merged on a coin-flip.
+    min_margin_over_runner_up: float = 0.05
+
+    # A track must accumulate this many consistent frames of evidence before
+    # its global id is committed and counted. Prevents a single lucky/unlucky
+    # crop from creating or merging an identity.
+    probation_frames: int = 3
+
+    # --- spatio-temporal prior --------------------------------------------
+    # Appearance is not the only evidence available, and on a weak feature
+    # extractor it is not even the strongest. A person who vanishes and
+    # reappears two seconds later, one metre from where they were, is almost
+    # certainly the same person — no clothing model required. Physics rules
+    # out the alternatives that appearance cannot.
+    #
+    # This was added after real footage: colour-histogram embeddings could not
+    # bridge a 3.5-second detection gap, but the position could.
+    use_motion_prior: bool = True
+
+    # A walking person covers at most this fraction of the frame width per
+    # second. Anything further apart than reach * tolerance is not the same
+    # human being, whatever the embedding says.
+    max_speed_frac_per_s: float = 0.55
+    motion_tolerance: float = 1.5
+
+    # Maximum similarity credit for being exactly where they were. Small on
+    # purpose: it should tip a borderline decision, never make one.
+    motion_bonus: float = 0.10
+
+    # --- solo re-association ----------------------------------------------
+    # The narrowest, safest override of appearance there is: when the scene
+    # contains exactly ONE plausible person, a track that reappears near
+    # where that person was, seconds later, IS that person — whatever the
+    # embedding says. There is nobody else it could be.
+    #
+    # This is not a trick, it is the same reasoning ByteTrack already applies
+    # inside its 30-frame buffer, extended to the seconds-long gaps that a
+    # detector produces when someone is half out of frame.
+    #
+    # It fires only when ALL of these hold, so a crowded scene never reaches
+    # it and two shoppers can never be merged by it:
+    #     * exactly one identity is within physical reach
+    #     * that identity was seen within solo_max_gap_seconds
+    #     * no OTHER identity has been seen at all in that window
+    #     * the reappearance is within solo_max_distance_frac of the frame
+    # DEFAULT OFF, and the reason is measured, not theoretical. Enabling it on
+    # a real clip did not recover the split it was written for, and it DID
+    # merge two different people in the regression suite: one person left, a
+    # different person appeared 0.6s later 283px away, and the rule declared
+    # them the same human. In a shop that sequence happens every few minutes.
+    #
+    # It is kept because on some installations it is genuinely safe — a single
+    # narrow corridor, a back entrance used by one member of staff. Turn it on
+    # only where you can argue that two people cannot swap places, and only
+    # after checking it against your own footage.
+    solo_reassociation: bool = False
+    solo_max_gap_seconds: float = 6.0
+    solo_max_distance_frac: float = 0.35
+
+    # Once a track is committed to a global id, it STAYS bound to it and is
+    # not re-matched every frame. Re-matching a stable track is pure cost and
+    # pure risk: the tracker is already better than ReID at short-range
+    # association. ReID exists to bridge gaps, not to second-guess the tracker.
+    sticky_binding: bool = True
+
+
+@dataclass
+class MemoryConfig:
+    """How long an identity survives, and where."""
+
+    # HOT tier: in-RAM, matched against on every new track. This is the
+    # "5-10 minutes" from the spec — it exists to bridge occlusions and
+    # walk-out-of-frame-and-back.
+    hot_ttl_seconds: float = 600.0
+
+    # WARM tier: an identity evicted from hot is not deleted, it is demoted.
+    # It is still matchable, which is the ONLY way "Returning Visitors" can
+    # work — a customer who comes back after 40 minutes is by definition
+    # outside the hot TTL. The spec's "TTL 10min -> Delete" and its
+    # "Returning Visitors" metric were in direct contradiction; two tiers
+    # resolve it.
+    warm_ttl_seconds: float = 12 * 3600.0
+
+    # Hard cap on hot identities, so a busy Saturday cannot exhaust RAM or
+    # turn matching into an O(n) scan of thousands of profiles.
+    max_hot_identities: int = 400
+    max_warm_identities: int = 5000
+
+    # Embeddings kept per identity. More views = more robust matching, but
+    # the gallery must stay small or matching cost explodes. 8 diverse crops
+    # is the sweet spot in the ReID literature and in practice.
+    gallery_size: int = 8
+
+    # A gallery entry is only replaced by a strictly better-quality crop.
+    # Otherwise a long dwell fills the gallery with near-identical frames of
+    # someone standing still, and the identity loses view diversity.
+    min_quality_improvement: float = 0.02
+
+
+@dataclass
+class ReIDConfig:
+    """When and how appearance embeddings are computed."""
+
+    backend: str = os.environ.get("COREWISE_REID_BACKEND", "auto")
+
+    # Crops per frame budget. The whole reason this exists: embedding every
+    # person on every frame is what turns a 25 FPS engine into a 6 FPS one.
+    # With this budget the cost is bounded no matter how crowded the store is.
+    max_crops_per_frame: int = 4
+
+    # A committed track is re-embedded at most this often (frames), only to
+    # refresh its gallery with new viewpoints.
+    refresh_every_n_frames: int = 30
+
+    # Floor on how often one track may be re-embedded when spending spare
+    # budget. Two crops a few frames apart are the same viewpoint, so they
+    # would cost inference and add nothing to gallery diversity.
+    min_frames_between_crops: int = 8
+
+    # ---- quality gate: crops that fail these are never embedded ----------
+    # A tiny, blurry or half-out-of-frame crop produces a garbage embedding,
+    # and a garbage embedding is worse than no embedding: it pollutes the
+    # gallery permanently and causes false merges forever after.
+    min_bbox_height_px: int = 90
+    min_bbox_width_px: int = 32
+    min_aspect_ratio: float = 1.2          # h/w — a person is taller than wide
+    max_aspect_ratio: float = 5.0
+    min_detection_confidence: float = 0.55
+    border_margin_px: int = 8              # touching the frame edge = truncated body
+    min_sharpness: float = 25.0            # variance of Laplacian
+
+    embedding_dim: int = 512
+
+    # Which part of the box becomes the embedding.
+    #   "full"       whole box. Correct when people are always fully visible.
+    #   "upper_body" head-to-hips ALWAYS, including when the legs are visible.
+    #                Consistency is the point: an embedding of a full body and
+    #                an embedding of a torso are not comparable, so mixing the
+    #                two silently destroys matching. One convention applied
+    #                everywhere costs a little trouser colour and buys
+    #                re-identification that survives people walking close.
+    #   "auto"       measure the footage: if bottom-truncation is common,
+    #                switch to upper_body for everything and say so once.
+    crop_mode: str = os.environ.get("COREWISE_CROP_MODE", "auto")
+    upper_body_fraction: float = 0.62
+    auto_sample_size: int = 60
+    auto_truncation_ratio: float = 0.25
+
+
+@dataclass
+class ZoneConfig:
+    """Entry/exit debouncing."""
+
+    # Frames a person must be consistently on the new side before the
+    # transition is accepted. Without hysteresis, someone standing on the
+    # threshold chatting generates dozens of Entered/Exited pairs and
+    # destroys every metric on the dashboard.
+    confirm_frames: int = 3
+
+    # After an accepted transition, ignore further transitions for this long.
+    transition_cooldown_seconds: float = 2.0
+
+    # A person not observed for this long has their open dwell interval
+    # banked. The VISIT stays open — a tracker gap is not a zone exit — so
+    # re-appearing inside the zone resumes the same dwell instead of
+    # restarting it. This single number is why identity-based SAM is more
+    # accurate than track-based SAM.
+    presence_grace_seconds: float = 3.0
+
+
+@dataclass
+class RetailConfig:
+    """TAM / SAM / SOM semantics.
+
+    The SAM threshold is deliberately NOT defaulted. tracking.py made the
+    dashboard the single source of truth by construction: until a value
+    arrives, SAM is not counted at all, so a stale engine-side default can
+    never silently win. That property is preserved here exactly.
+    """
+
+    sam_min_stay_enabled: bool = False
+    sam_min_stay_seconds: Optional[float] = None
+    sam_configured: bool = False
+
+    # Which zone name carries TAM, and which carries the entrance.
+    tam_zone: str = "__tam__"
+    som_zone: str = "__som__"
+
+
+@dataclass
+class IdentityConfig:
+    """Root config object passed to the IdentityManager."""
+
+    camera_id: str = field(default_factory=lambda: os.environ.get("CAMERA_ID", "cam_1"))
+    matching: MatchingConfig = field(default_factory=MatchingConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    reid: ReIDConfig = field(default_factory=ReIDConfig)
+    zones: ZoneConfig = field(default_factory=ZoneConfig)
+    retail: RetailConfig = field(default_factory=RetailConfig)
+
+    # Cross-camera identity is resolved centrally (corewise_server.py), not
+    # per-engine. When False the engine allocates local ids only and the
+    # server owns global id assignment.
+    allow_local_global_ids: bool = True
+
+    # Print per-track commit decisions ("track=7 -> person_ab12 (new)").
+    debug: bool = False
+
+    # PRIVACY: raw person crops are never persisted, only embeddings, and
+    # only for the retention window above. Flip this on solely for offline
+    # threshold tuning on footage you own, never in production.
+    persist_crops_for_debug: bool = False
+
+    debug: bool = os.environ.get("COREWISE_IDENTITY_DEBUG", "0") not in ("0", "false", "False")
