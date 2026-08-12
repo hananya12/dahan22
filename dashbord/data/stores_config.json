@@ -1,0 +1,107 @@
+{
+  "super_dahan": {
+    "store_id": "super_dahan",
+    "store_name": "Super Dahan",
+    "username": "super_dahan",
+    "password_hash": "eeccbc1822b7b979f7587d0250247cc24b89542e3dd7c13c25d0a89f84d3c0ed",
+    "enabled": true,
+    "settings": {}
+  },
+  "super_pharm": {
+    "store_id": "super_pharm",
+    "store_name": "Super-Pharm",
+    "username": "super_pharm",
+    "password_hash": "be517480940dcda6fdc656f8b6da507a3de8e36a7e9c71a882fef2ae01e38231",
+    "enabled": true,
+    "settings": {}
+  },
+
+  "mania_jeans": {
+    "store_id": "mania_jeans",
+    "store_name": "Mania Jeans",
+    "username": "mania_jeans",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "renuar": {
+    "store_id": "renuar",
+    "store_name": "Renuar",
+    "username": "renuar",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "mega_sport": {
+    "store_id": "mega_sport",
+    "store_name": "Mega Sport",
+    "username": "mega_sport",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "golda": {
+    "store_id": "golda",
+    "store_name": "Golda",
+    "username": "golda",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "sushimoto": {
+    "store_id": "sushimoto",
+    "store_name": "SushiMoto",
+    "username": "sushimoto",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "idan_2000": {
+    "store_id": "idan_2000",
+    "store_name": "Idan 2000",
+    "username": "idan_2000",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "laline": {
+    "store_id": "laline",
+    "store_name": "Laline",
+    "username": "laline",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "steimatzky": {
+    "store_id": "steimatzky",
+    "store_name": "Steimatzky",
+    "username": "steimatzky",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "stock_big": {
+    "store_id": "stock_big",
+    "store_name": "Stock BIG",
+    "username": "stock_big",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "shuka_bair": {
+    "store_id": "shuka_bair",
+    "store_name": "Shuka Ba'ir",
+    "username": "shuka_bair",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  },
+  "pizza_hut": {
+    "store_id": "pizza_hut",
+    "store_name": "Pizza Hut",
+    "username": "pizza_hut",
+    "password_hash": "057ba03d6c44104863dc7361fe4578965d1887360f90a0895882e58a6248fc86",
+    "enabled": false,
+    "settings": {}
+  }
+}

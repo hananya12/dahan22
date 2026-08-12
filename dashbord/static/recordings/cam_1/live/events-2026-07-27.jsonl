@@ -1,0 +1,4 @@
+{"t": 1785146841.79637, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785147066.4250517, "kind": "person", "data": {"id": 1}}
+{"t": 1785147067.8053355, "kind": "som", "data": {"som": 1, "delta": 1}}
+{"t": 1785147068.078349, "kind": "tam", "data": {"tam": 1, "delta": 1}}

@@ -1,0 +1,45 @@
+{"t": 1785057270.8088264, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785057499.2093446, "kind": "person", "data": {"id": 1}}
+{"t": 1785057504.735202, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785057505.657374, "kind": "som", "data": {"som": 1, "delta": 1}}
+{"t": 1785057506.7870643, "kind": "sam", "data": {"sam": 1, "delta": 1}}
+{"t": 1785058208.3990788, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785058254.6480086, "kind": "person", "data": {"id": 1}}
+{"t": 1785058276.0896142, "kind": "person", "data": {"id": 1}}
+{"t": 1785058276.0912392, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785063341.9999883, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785063685.0103743, "kind": "person", "data": {"id": 1}}
+{"t": 1785063686.345672, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785063686.3475518, "kind": "som", "data": {"som": 1, "delta": 1}}
+{"t": 1785063726.7098527, "kind": "person", "data": {"id": 2}}
+{"t": 1785063748.5065632, "kind": "person", "data": {"id": 4}}
+{"t": 1785063796.4979727, "kind": "person", "data": {"id": 5}}
+{"t": 1785063826.261765, "kind": "person", "data": {"id": 5}}
+{"t": 1785063829.1127918, "kind": "person", "data": {"id": 7}}
+{"t": 1785063830.6482854, "kind": "tam", "data": {"tam": 2, "delta": 1}}
+{"t": 1785063830.6514366, "kind": "som", "data": {"som": 2, "delta": 1}}
+{"t": 1785063833.4855328, "kind": "sam", "data": {"sam": 1, "delta": 1}}
+{"t": 1785063848.9691575, "kind": "person", "data": {"id": 5}}
+{"t": 1785065161.5024815, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785065287.2359114, "kind": "person", "data": {"id": 1}}
+{"t": 1785065289.6614578, "kind": "som", "data": {"som": 1, "delta": 1}}
+{"t": 1785065295.8466432, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785065299.582843, "kind": "sam", "data": {"sam": 1, "delta": 1}}
+{"t": 1785065457.170635, "kind": "person", "data": {"id": 3}}
+{"t": 1785065457.8412666, "kind": "person", "data": {"id": 4}}
+{"t": 1785066009.4998043, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785066142.7292166, "kind": "person", "data": {"id": 1}}
+{"t": 1785066143.35877, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785066143.3604977, "kind": "som", "data": {"som": 1, "delta": 1}}
+{"t": 1785066145.6686127, "kind": "sam", "data": {"sam": 1, "delta": 1}}
+{"t": 1785066145.9802816, "kind": "person", "data": {"id": 3}}
+{"t": 1785067519.073695, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785068528.5904653, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785068748.8780658, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785068818.5037727, "kind": "rec_stop", "data": {"camera": "cam_1"}}
+{"t": 1785069163.10589, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785069226.7621071, "kind": "rec_stop", "data": {"camera": "cam_1"}}
+{"t": 1785069252.6919541, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785069439.8764153, "kind": "person", "data": {"id": 4}}
+{"t": 1785069439.8780005, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785069440.6252847, "kind": "som", "data": {"som": 1, "delta": 1}}

@@ -1,0 +1,15 @@
+# Corewise dashboard configuration.
+#
+# enableStaticServing is REQUIRED by the Replay System. Recordings are written
+# to ./static/recordings/... and served to the browser as app/static/... .
+# Without this setting every <video> source returns 404 and the Replay player
+# renders as a BLACK SCREEN — one of the root causes of the reported bug.
+#
+# recording_paths.py documents this contract; the file itself was missing from
+# the project, so it is shipped here.
+
+[server]
+enableStaticServing = true
+
+[theme]
+base = "dark"

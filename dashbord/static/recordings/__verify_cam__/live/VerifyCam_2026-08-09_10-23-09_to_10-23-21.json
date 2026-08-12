@@ -1,0 +1,15 @@
+{
+  "camera_id": "__verify_cam__",
+  "camera_name": "VerifyCam",
+  "file": "VerifyCam_2026-08-09_10-23-09_to_10-23-21.mp4",
+  "start_epoch": 1786260189.1714227,
+  "end_epoch": 1786260201.1725097,
+  "duration": 12.0,
+  "playback_seconds": 12.0,
+  "width": 320,
+  "height": 240,
+  "fps": 10,
+  "codec": "h264",
+  "browser_playable": true,
+  "size_bytes": 5071888
+}

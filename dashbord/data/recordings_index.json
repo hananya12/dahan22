@@ -1,0 +1,49 @@
+{
+  "cam_1": {
+    "2026-07-22": {
+      "13": {
+        "path": "C:/Users/Hayha/Desktop/dashbord/static/recordings/cam_1/2026-07-22/13.mp4",
+        "size": 710865,
+        "mtime": 1784718000.136201
+      },
+      "14": {
+        "path": "C:/Users/Hayha/Desktop/dashbord/static/recordings/cam_1/2026-07-22/14.mp4",
+        "size": 1725365,
+        "mtime": 1784718248.2715852
+      }
+    },
+    "2026-07-26": {
+      "09": {
+        "path": "C:/Users/Hayha/Desktop/dashbord/static/recordings/cam_1/2026-07-26/09.mp4",
+        "size": 5393151,
+        "mtime": 1785049200.244284
+      },
+      "13": {
+        "path": "C:/Users/Hayha/Desktop/dashbord/static/recordings/cam_1/2026-07-26/13.mp4",
+        "size": 475517,
+        "mtime": 1785063600.8457046
+      }
+    },
+    "2026-07-27": {
+      "13": {
+        "path": "C:/Users/Hayha/Desktop/dashbord/static/recordings/cam_1/2026-07-27/13.mp4",
+        "size": 568441,
+        "mtime": 1785150000.5233235
+      }
+    },
+    "2026-07-28": {
+      "17": {
+        "path": "C:/Users/Hayha/Desktop/dashbord/static/recordings/cam_1/2026-07-28/17.mp4",
+        "size": 285436,
+        "mtime": 1785250800.1945827
+      }
+    },
+    "2026-08-03": {
+      "14": {
+        "path": "C:/Users/Hayha/Downloads/_vscode_updated (1)/dashbord/static/recordings/cam_1/2026-08-03/14.mp4",
+        "size": 2594480,
+        "mtime": 1785755714.5100768
+      }
+    }
+  }
+}

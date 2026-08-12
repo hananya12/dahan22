@@ -1,0 +1,3 @@
+{"t": 1786260189.167917, "kind": "rec_start", "data": {"camera": "VerifyCam"}}
+{"t": 1786260201.1710095, "kind": "som", "data": {"som": 1}}
+{"t": 1786260201.1720095, "kind": "rec_stop", "data": {"camera": "VerifyCam"}}

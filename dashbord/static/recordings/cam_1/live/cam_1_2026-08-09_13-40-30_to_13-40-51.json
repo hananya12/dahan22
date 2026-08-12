@@ -1,0 +1,15 @@
+{
+  "camera_id": "cam_1",
+  "camera_name": "cam_1",
+  "file": "cam_1_2026-08-09_13-40-30_to_13-40-51.mp4",
+  "start_epoch": 1786272030.4589155,
+  "end_epoch": 1786272051.0131314,
+  "duration": 20.55,
+  "playback_seconds": 1.5,
+  "width": 640,
+  "height": 480,
+  "fps": 10,
+  "codec": "h264",
+  "browser_playable": true,
+  "size_bytes": 82303
+}

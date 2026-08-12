@@ -1,0 +1,54 @@
+# Core computer vision + face recognition (LBPH lives in the "contrib" build)
+opencv-contrib-python>=4.8.0
+
+# YOLO object detection (installs PyTorch automatically as a dependency)
+ultralytics>=8.0.0
+
+# Numerical operations
+numpy>=1.24.0
+
+# Ships a static ffmpeg binary. The Replay System needs H.264 to produce clips
+# a browser can actually decode; without an encoder it falls back to OpenCV's
+# mp4v, which no browser plays (Replay then shows key frames only). This wheel
+# means Windows users do not have to install ffmpeg system-wide.
+imageio-ffmpeg>=0.4.9
+
+# Real-time communication between main.py, app.py and corewise_server.py.
+# Upper bound is deliberate: corewise_server.py uses the legacy
+# websockets.server.WebSocketServerProtocol API, which is deprecated and
+# scheduled for removal. Pinning below 17 stops a future install from
+# breaking the server without warning.
+websockets>=12.0,<17.0
+
+# Dashboard
+streamlit>=1.32.0
+streamlit-autorefresh>=1.0.1
+pandas>=2.0.0
+altair>=5.0.0
+requests>=2.31.0
+
+# Click-to-calibrate canvas in the Camera Settings wizard. This is a HARD
+# import in app.py - without it the dashboard crashes on startup. It was
+# missing from this file, so a clean `pip install -r requirements.txt`
+# produced a dashboard that could not start.
+streamlit-image-coordinates>=0.1.6
+
+# Calibration overlay rendering (PIL) in app.py.
+Pillow>=10.0.0
+
+# System Health page: CPU / RAM / disk metrics. main.py degrades gracefully
+# if this is absent, but the page shows no data without it.
+psutil>=5.9.0
+
+# Optional: named person identification (face_recognition.py).
+# main.py degrades gracefully (identification disabled) if this is missing.
+face_recognition>=1.3.0
+
+# Windows-only: lets camera.py find the Iriun Webcam by its device NAME
+# instead of guessing index numbers.
+pygrabber>=0.2; platform_system == "Windows"
+# --- Optional: strong Person Re-ID backend (OSNet). Without these the
+# identity system runs on the built-in colour-histogram baseline, which is
+# fine for single-camera short gaps but weak across cameras.
+# torch
+# torchreid

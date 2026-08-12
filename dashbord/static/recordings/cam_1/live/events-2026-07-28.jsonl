@@ -1,0 +1,20 @@
+{"t": 1785250474.5320187, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785250726.5243347, "kind": "person", "data": {"id": 3}}
+{"t": 1785250916.155523, "kind": "person", "data": {"id": 7}}
+{"t": 1785250920.073372, "kind": "som", "data": {"som": 1, "delta": 1}}
+{"t": 1785250920.7411258, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785250927.0633657, "kind": "person", "data": {"id": 10}}
+{"t": 1785250927.0649416, "kind": "tam", "data": {"tam": 2, "delta": 1}}
+{"t": 1785250931.72897, "kind": "person", "data": {"id": 13}}
+{"t": 1785250931.7305217, "kind": "tam", "data": {"tam": 3, "delta": 1}}
+{"t": 1785250933.7569265, "kind": "sam", "data": {"sam": 1, "delta": 1}}
+{"t": 1785250936.2246664, "kind": "som", "data": {"som": 2, "delta": 1}}
+{"t": 1785255074.5177395, "kind": "rec_start", "data": {"camera": "cam_1"}}
+{"t": 1785255315.122848, "kind": "person", "data": {"id": 1}}
+{"t": 1785255317.5156555, "kind": "tam", "data": {"tam": 1, "delta": 1}}
+{"t": 1785255321.2128997, "kind": "person", "data": {"id": 2}}
+{"t": 1785255321.214397, "kind": "tam", "data": {"tam": 2, "delta": 1}}
+{"t": 1785255326.585598, "kind": "person", "data": {"id": 5}}
+{"t": 1785255326.5870109, "kind": "tam", "data": {"tam": 3, "delta": 1}}
+{"t": 1785255328.6680624, "kind": "sam", "data": {"sam": 1, "delta": 1}}
+{"t": 1785255330.1772327, "kind": "som", "data": {"som": 1, "delta": 1}}
